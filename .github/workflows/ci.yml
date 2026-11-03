@@ -1,4 +1,5 @@
-name: Cloud Native CI Pipeline
+
+name: Cloud Native CI/CD Pipeline
 
 on:
   push:
@@ -7,6 +8,10 @@ on:
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   build:
@@ -21,3 +26,57 @@ jobs:
 
       - name: Verify Docker image
         run: docker images cloud-native-app
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::761334627711:role/GitHubActions-EC2-Deploy
+          aws-region: us-east-1
+
+      - name: Deploy to EC2 using SSM
+        env:
+          INSTANCE_ID: i-01231fe5e8a5e3ccf
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -e",
+              "apt-get update -y",
+              "apt-get install -y git",
+              "if [ ! -d /opt/cloud-native-deployment/.git ]; then git clone https://github.com/Saisreeramkakarla/-cloud-native-deployment.git /opt/cloud-native-deployment; fi",
+              "cd /opt/cloud-native-deployment",
+              "git fetch origin",
+              "git reset --hard origin/main",
+              "docker build -t cloud-native-app:latest ./app",
+              "docker rm -f cloud-app || true",
+              "docker run -d --name cloud-app -p 80:80 --restart unless-stopped cloud-native-app:latest",
+              "curl -fsS http://localhost/ > /dev/null"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          if ! aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardErrorContent" \
+              --output text
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" \
+            --output text
